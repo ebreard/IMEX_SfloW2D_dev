@@ -1366,6 +1366,7 @@ CONTAINS
     REAL(wp) :: r_alphac
 
     REAL(wp) :: alphas_tot                !< total solid fraction
+    REAL(wp) :: sum_sl                    !< alphas_tot + r_alphal
 
     REAL(wp) :: r_inv_rhom
 
@@ -1428,6 +1429,42 @@ CONTAINS
 
        END IF
 
+    END IF
+
+    ! Cap alphas_tot+alphal to keep carrier slot positive. Without this the
+    ! (1-r_alphal-alphas_tot) denominator below can divide by zero when a cell
+    ! approaches max packing, producing NaN that propagates to r_rho_m and
+    ! every downstream quantity. Mirrors the regularization in qp_to_qc.
+    IF ( alphas_tot .LT. 0.0_wp ) THEN
+       r_alphas(1:n_solid) = 0.0_wp
+       alphas_tot = 0.0_wp
+    END IF
+
+    IF ( gas_flag .AND. liquid_flag ) THEN
+       IF ( ( alphas_tot + r_alphal ) .GT. ( 1.0_wp - 1.0E-10_wp ) ) THEN
+          sum_sl = alphas_tot + r_alphal
+          r_alphas(1:n_solid) = r_alphas(1:n_solid) * (1.0_wp-1.0E-10_wp) / sum_sl
+          r_alphal = r_alphal * (1.0_wp - 1.0E-10_wp) / sum_sl
+          alphas_tot = SUM(r_alphas)
+       END IF
+    ELSE
+       IF ( alphas_tot .GT. ( 1.0_wp - 1.0E-10_wp ) ) THEN
+          r_alphas(1:n_solid) = r_alphas(1:n_solid) * (1.0_wp-1.0E-10_wp)       &
+               / alphas_tot
+          alphas_tot = 1.0_wp - 1.0E-10_wp
+       END IF
+    END IF
+
+    ! Rescale r_alphag to fit inside the remaining carrier slot. Without this
+    ! the carrier-density formula below can produce a wildly negative r_rho_c
+    ! when the added-gas fractions push the non-air total beyond 1.
+    IF ( gas_flag .AND. n_add_gas .GT. 0 ) THEN
+       IF ( SUM(r_alphag(1:n_add_gas)) .GT.                                     &
+            ( 1.0_wp - r_alphal - alphas_tot ) ) THEN
+          r_alphag(1:n_add_gas) = r_alphag(1:n_add_gas) *                       &
+               MAX( 0.0_wp, 1.0_wp - r_alphal - alphas_tot ) /                  &
+               MAX( EPSILON(1.0_wp), SUM(r_alphag(1:n_add_gas)) )
+       END IF
     END IF
 
     ! carrier phase volume fraction
@@ -1849,6 +1886,22 @@ CONTAINS
 
     END IF
 
+    ! Pre-clamp alphas_tot + r_alphal to avoid divide-by-zero in r_rho_c. When
+    ! a cell reaches max packing the (1 - r_alphal - alphas_tot) denominator
+    ! a few lines below divides by ~0, producing NaN that propagates to mass,
+    ! rho_m, and every downstream quantity.
+    IF ( ( alphas_tot + r_alphal ) .GT. ( 1.0_wp - 1.0E-10_wp ) ) THEN
+       sum_sl = alphas_tot + r_alphal
+       r_alphas(1:n_solid) = r_alphas(1:n_solid) * ( 1.0_wp - 1.0E-10_wp ) / sum_sl
+       r_alphal = r_alphal * ( 1.0_wp - 1.0E-10_wp ) / sum_sl
+       alphas_tot = SUM(r_alphas)
+       r_alphas_rhos(1:n_solid) = r_alphas(1:n_solid) * rho_s(1:n_solid)
+    ELSEIF ( alphas_tot .LT. 0.0_wp ) THEN
+       r_alphas(1:n_solid) = 0.0_wp
+       r_alphas_rhos(1:n_solid) = 0.0_wp
+       alphas_tot = 0.0_wp
+    END IF
+
     IF ( gas_flag ) THEN
 
        ! continuous phase is air
@@ -2230,16 +2283,20 @@ CONTAINS
     r_u = qpj(idx_u)
     r_v = qpj(idx_v)
 
-    IF ( r_red_grav * r_h .LT. 0.0_wp ) THEN
+    ! Use |r_red_grav| for celerity to maintain KT numerical diffusion even
+    ! when the mixture is lighter than ambient (heated/dilute margin cells).
+    ! Without ABS, celerity collapses to zero at buoyant cells and the KT
+    ! scheme loses diffusion at flow fronts.
+    IF ( r_h .GT. 0.0_wp ) THEN
 
-       vel_min(1:n_eqns) = r_u
-       vel_max(1:n_eqns) = r_u
+       r_celerity = SQRT( ABS(r_red_grav) * r_h * grav_coeff )
+       vel_min(1:n_eqns) = r_u - r_celerity
+       vel_max(1:n_eqns) = r_u + r_celerity
 
     ELSE
 
-       r_celerity = SQRT( r_red_grav * r_h * grav_coeff )
-       vel_min(1:n_eqns) = r_u - r_celerity
-       vel_max(1:n_eqns) = r_u + r_celerity
+       vel_min(1:n_eqns) = 0.0_wp
+       vel_max(1:n_eqns) = 0.0_wp
 
     END IF
 
@@ -2289,16 +2346,17 @@ CONTAINS
     r_u = qpj(idx_u)
     r_v = qpj(idx_v)
 
-    IF ( r_red_grav * r_h .LT. 0.0_wp ) THEN
+    ! Use |r_red_grav| (same rationale as eval_local_speeds_x).
+    IF ( r_h .GT. 0.0_wp ) THEN
 
-       vel_min(1:n_eqns) = r_v
-       vel_max(1:n_eqns) = r_v
+       r_celerity = SQRT( grav_coeff * ABS(r_red_grav) * r_h )
+       vel_min(1:n_eqns) = r_v - r_celerity
+       vel_max(1:n_eqns) = r_v + r_celerity
 
     ELSE
 
-       r_celerity = SQRT( grav_coeff * r_red_grav * r_h )
-       vel_min(1:n_eqns) = r_v - r_celerity
-       vel_max(1:n_eqns) = r_v + r_celerity
+       vel_min(1:n_eqns) = 0.0_wp
+       vel_max(1:n_eqns) = 0.0_wp
 
     END IF
 
@@ -2385,8 +2443,12 @@ CONTAINS
           flux(1) = r_u * qcj(1) * shape_coeff(1)
 
           ! x-momentum flux in x-direction + hydrostatic pressure term
+          ! Clamp reduced gravity >= 0 for buoyant mixtures: a cell lighter
+          ! than ambient cannot exert positive hydrostatic pressure on its
+          ! neighbours, and a negative value drives unphysical accelerations
+          ! at heated/dilute margin cells.
           flux(2) = r_u * qcj(2) * shape_coeff(2) + 0.5_wp * r_rho_m *          &
-               grav_coeff * r_red_grav * r_h**2
+               grav_coeff * MAX(r_red_grav, 0.0_wp) * r_h**2
 
           ! y-momentum flux in x-direction: u * ( rho * h * v )
           flux(3) = r_u * qcj(3) * shape_coeff(3)
@@ -2395,7 +2457,7 @@ CONTAINS
 
              ! ENERGY flux in x-direction
              flux(4) = r_u * ( qcj(4) * shape_coeff(4) + 0.5_wp * r_rho_m       &
-                  * grav_coeff * r_red_grav * r_h**2 )
+                  * grav_coeff * MAX(r_red_grav, 0.0_wp) * r_h**2 )
 
           ELSE
 
@@ -2450,14 +2512,15 @@ CONTAINS
 
           flux(2) = r_v * qcj(2) * shape_coeff(2)
 
+          ! y-momentum flux in y-direction + hydrostatic pressure (clamped).
           flux(3) = r_v * qcj(3) * shape_coeff(3) + 0.5_wp * r_rho_m *          &
-               grav_coeff * r_red_grav * r_h**2
+               grav_coeff * MAX(r_red_grav, 0.0_wp) * r_h**2
 
           IF ( energy_flag ) THEN
 
              ! ENERGY flux in x-direction
              flux(4) = r_v * ( qcj(4) * shape_coeff(4) + 0.5_wp * r_rho_m *     &
-                  grav_coeff * r_red_grav * r_h**2 )
+                  grav_coeff * MAX(r_red_grav, 0.0_wp) * r_h**2 )
 
           ELSE
 
@@ -3122,15 +3185,18 @@ CONTAINS
 
        END IF
 
-       r_tilde_grav = r_red_grav + centr_force_term
+       ! Clamp reduced gravity >= 0 for buoyant mixtures (same as eval_fluxes).
+       r_tilde_grav = MAX(r_red_grav, 0.0_wp) + centr_force_term
 
        ! units of dqc(2)/dt [kg m-1 s-2]
        expl_term(2) = - grav_coeff * r_rho_m * r_tilde_grav * r_h * Bprimej_x  &
-            + 0.5_wp * r_rho_m * r_red_grav * r_h**2 * d_grav_coeff_dx
+            + 0.5_wp * r_rho_m * MAX(r_red_grav, 0.0_wp) * r_h**2 *            &
+            d_grav_coeff_dx
 
        ! units of dqc(3)/dt [kg m-1 s-2]
        expl_term(3) = - grav_coeff * r_rho_m * r_tilde_grav * r_h * Bprimej_y  &
-            + 0.5_wp * r_rho_m * r_red_grav * r_h**2 * d_grav_coeff_dy
+            + 0.5_wp * r_rho_m * MAX(r_red_grav, 0.0_wp) * r_h**2 *            &
+            d_grav_coeff_dy
 
        IF ( energy_flag ) THEN
 

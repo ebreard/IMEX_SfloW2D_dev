@@ -1830,6 +1830,11 @@ CONTAINS
           erodible_fract(1:n_solid) = 1.0_wp/n_solid
           T_erodible = 300.0_wp
           !subtract_init_flag = .FALSE.
+          ! coeff_porosity is used by eval_mass_exchange_terms regardless of
+          ! erosion_coeff; without this init it stays uninitialised and any
+          ! NaN in that memory leaks into eqns_term via
+          ! (NaN * SUM(deposition_term)) even when deposition_term is zero.
+          coeff_porosity = 0.0_wp
 
         ELSE
 
